@@ -122,10 +122,6 @@ class TTALoop(TestLoop):
                                   data_batch=data_batch, 
                                   outputs=[merged_sample])
 
-        # --- Fim do loop de dataloader ---
-        
-        # Avalia as métricas acumuladas
-        
 
         metrics = self.evaluator.evaluate(len(self.dataloader.dataset))
 
