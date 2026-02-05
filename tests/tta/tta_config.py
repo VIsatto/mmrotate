@@ -19,44 +19,56 @@ from mmrotate.utils import register_all_modules
 class TTALoop():
     """Test time augmentation (TTA) loop."""
 
-    def __init__(self, tta_config, dataloader, evaluator, runner, fp16=None, canonical_box_list = None):
-        self.tta_pipeline = Compose(tta_config)
-        self.dataloader = dataloader
-        self.evaluator = evaluator
+    def __init__(self, test_pipeline, dataloader, evaluator, runner, angles, fp16=None):
         self.runner = runner
-        self.canonical_box_list = canonical_box_list
-        
-        if isinstance(evaluator, dict) or isinstance(evaluator, list):
-            self.evaluator = runner.build_evaluator(evaluator)  # type: ignore
-        else:
-            self.evaluator = evaluator  # type: ignore
+        self.evaluator = runner.build_evaluator(evaluator)  
+        self.dataloader = runner.build_dataloader(dataloader)
+        self.test_pipeline = test_pipeline
+        self.angles = angles
+        self.evaluator = runner.build_evaluator(evaluator)  
+
         if hasattr(self.dataloader.dataset, 'metainfo'):
             self.evaluator.dataset_meta = self.dataloader.dataset.metainfo
             self.runner.visualizer.dataset_meta = \
                 self.dataloader.dataset.metainfo
+        
         self.fp16 = fp16
         self.test_loss: Dict[str, HistoryBuffer] = dict()
+        
 
     def run(self) -> dict:
         """Launch test."""
         self.runner.call_hook('before_test')
         self.runner.call_hook('before_test_epoch')
         aug_list = []
-        for i, data_batch in enumerate(self.dataloader):
-            print('Batch:', i)
-            with torch.no_grad():
-                outputs = self.runner.model.test_step(data_batch)
-                pred_sample = outputs[0]
-                if(self.canonical_box_list == None):
-                    canonical_boxes = pred_sample.pred_instances.bboxes
-                    canonical_scores = pred_sample.pred_instances.scores
-                    augmented_boxes_list = [[box] for box in canonical_boxes]
-                    augmented_scores_list = [[score] for score in canonical_scores]
-                    aug_list.append(pred_sample)
-                    continue
-                else:
-                    exit()
-        return aug_list, augmented_boxes_list, augmented_scores_list
+        for angle in self.angles:
+            self.test_pipeline = [
+                dict(type='mmdet.LoadImageFromFile', backend_args=None),
+                dict(type='mmdet.Resize', scale=(1100, 800), keep_ratio=True),
+                dict(type='mmdet.LoadAnnotations', with_bbox=True, box_type='qbox'),
+                dict(type='ConvertBoxType', box_type_mapping=dict(gt_bboxes='rbox')),
+                dict(type='Rotate', rotate_angle=angle), # O ângulo muda aqui
+                dict(
+                    type='mmdet.PackDetInputs',
+                    meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor'))
+                ]
+            self.dataloader.dataset.pipeline = Compose(self.test_pipeline)
+            
+            for i, data_batch in enumerate(self.dataloader):
+                print('Batch:', i)
+                with torch.no_grad():
+                    outputs = self.runner.model.test_step(data_batch)
+                    pred_sample = outputs[0]
+                    if(self.canonical_box_list == None):
+                        canonical_boxes = pred_sample.pred_instances.bboxes
+                        canonical_scores = pred_sample.pred_instances.scores
+                        augmented_boxes_list = [[box] for box in canonical_boxes]
+                        augmented_scores_list = [[score] for score in canonical_scores]
+                        aug_list.append(pred_sample)
+                        continue
+                    else:
+                        exit()
+        return aug_list
 
     def merge_tta_output(self, bbox_list, scores_list):
         exit()
@@ -155,39 +167,19 @@ def main():
     runner = Runner.from_cfg(cfg)
     
     angles_to_test = [0, 90, 180, 270]
-    aug_list = []
-    canonical_box_list = None
-    for i ,angle in enumerate(angles_to_test):
-        print(f"\n>>> Iniciando Teste com Ângulo: {angle} graus")
-        
-        # 1. Atualiza dinamicamente o pipeline na configuração
-        new_pipeline = [
-            dict(type='mmdet.LoadImageFromFile', backend_args=None),
-            dict(type='mmdet.Resize', scale=(1100, 800), keep_ratio=True),
-            dict(type='mmdet.LoadAnnotations', with_bbox=True, box_type='qbox'),
-            dict(type='ConvertBoxType', box_type_mapping=dict(gt_bboxes='rbox')),
-            # dict(type='Rotate', rotate_angle=angle), # O ângulo muda aqui
-            dict(
-                type='mmdet.PackDetInputs',
-                meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor'))
+    # 1. Atualiza dinamicamente o pipeline na configuração
 
-        ]
-        cfg.test_pipeline = new_pipeline
-        cfg.test_dataloader.dataset.pipeline = new_pipeline
-        test_loader = runner.build_dataloader(cfg.test_dataloader)
+    tta_loop = TTALoop(
+        test_pipeline = cfg.test_pipeline, 
+        dataloader = cfg.test_dataloader, 
+        runner=runner,
+        evaluator = cfg.test_evaluator,
+        angles= angles_to_test,
+    )
 
-       
-        tta_loop = TTALoop(
-            tta_config=cfg.test_pipeline, 
-            dataloader=test_loader, 
-            evaluator=cfg.test_evaluator, 
-            runner=runner,
-            canonical_box_list= canonical_box_list
-        )
-
-        # 4. Executa o teste e armazena os resultados
-        box_list = tta_loop.run()
-        exit()
+    # 4. Executa o teste e armazena os resultados
+    box_list = tta_loop.run()
+    exit()
         
 
 if __name__ == '__main__':
