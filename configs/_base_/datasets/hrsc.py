@@ -1,3 +1,4 @@
+
 # dataset settings
 dataset_type = 'HRSCDataset'
 data_root = 'data/hrsc/'
@@ -28,6 +29,7 @@ val_pipeline = [
 test_pipeline = [
     dict(type='mmdet.LoadImageFromFile', backend_args=backend_args),
     dict(type='mmdet.Resize', scale=(800, 512), keep_ratio=True),
+    dict(type='Rotate', rotate_angle=0),
     dict(
         type='mmdet.PackDetInputs',
         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
