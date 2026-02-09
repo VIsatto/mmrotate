@@ -12,6 +12,7 @@ from mmcv.ops import box_iou_rotated as IoU
 from mmdet.utils import register_all_modules as register_all_modules_mmdet
 
 from mmengine.structures import InstanceData
+from mmengine.runner import load_checkpoint
 from mmdet.structures import DetDataSample
 
 from mmrotate.utils import register_all_modules
@@ -20,9 +21,21 @@ from mmrotate.utils import register_all_modules
 
 def run_tta(cfg, runner, angles):
 
+    cfg.test_dataloader.dataset.test_mode = False
+
     evaluator = runner.build_evaluator(cfg.test_evaluator)  
     dataloader = runner.build_dataloader(cfg.test_dataloader)
 
+
+    test_pipeline = cfg.val_pipeline
+    
+    test_pipeline.insert(-1, dict(type='Rotate', rotate_angle=angles[0]))
+
+    print(test_pipeline)
+    
+    
+    dataloader.dataset.pipeline = Compose(test_pipeline)
+    
     if hasattr(dataloader.dataset, 'metainfo'):
         evaluator.dataset_meta = dataloader.dataset.metainfo
         runner.visualizer.dataset_meta = \
@@ -39,64 +52,62 @@ def run_tta(cfg, runner, angles):
     data_samples = []
 
     canonical_boxes = None
-    for angle in angles:
+   
 
-        test_pipeline = [
-            dict(type='mmdet.LoadImageFromFile', backend_args=None),
-            dict(type='mmdet.Resize', scale=(1100, 800), keep_ratio=True),
-            dict(type='mmdet.LoadAnnotations', with_bbox=True, box_type='qbox'),
-            dict(type='ConvertBoxType', box_type_mapping=dict(gt_bboxes='rbox')),
-            dict(type='Rotate', rotate_angle=angle), # Variável para alterar o angulo de rotação do TTA
-            dict(
-                type='mmdet.PackDetInputs',
-                meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor'))
-            ]
-        
-        dataloader.dataset.pipeline = Compose(test_pipeline)
-
-        for i, data_batch in enumerate(dataloader):
+    for i, data_batch in enumerate(dataloader):
+        for angle in angles:
             print(f'Angulo: {angle}; Batch: {i}')
 
+            for transform in test_pipeline:
+                    if transform.get('type') == 'Rotate':
+                        transform['rotate_angle'] = angle
+                        dataloader.dataset.pipeline = Compose(test_pipeline)
             with torch.no_grad():
                 outputs = runner.model.test_step(data_batch)
                 pred_sample = outputs[0]
+                if angle == 0:
+                    print(f"Base (0°): {pred_sample.pred_instances.bboxes[0, :2]}") # Centro da primeira detecção
 
-                if(angle == 0):
-                    canonical_boxes = pred_sample.pred_instances.bboxes
-                    canonical_scores = pred_sample.pred_instances.scores
-                    augmented_boxes_list = [[box] for box in canonical_boxes]
-                    augmented_scores_list = [[score] for score in canonical_scores]
 
-                    canon_boxes.append(augmented_boxes_list)
-                    canon_scores.append(augmented_scores_list)
-                    data_samples.append(data_batch['data_samples'][0])
-                    
-                    final_sample = solo_evaluate(pred_sample, data_samples[i], evaluator, runner)
+            if(angle == 0):
+                canonical_boxes = pred_sample.pred_instances.bboxes
+                canonical_scores = pred_sample.pred_instances.scores
+                augmented_boxes_list = [[box] for box in canonical_boxes]
+                augmented_scores_list = [[score] for score in canonical_scores]
 
-                    runner.call_hook('after_val_iter', 
-                        batch_idx=i, 
-                        data_batch=data_batch, 
-                        outputs=[final_sample])
-   
-                    
-                else:
-                    new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, pred_sample.metainfo, angle)
-                    var = IoU(canon_boxes[i], new_boxes)
-                    ind_max = var.argmax(dim=1)
-                    #Revisar a lógica por trás dos índices do var[j][ind_max[j]]
-                    for j, list_of_boxes in enumerate(canon_boxes[i]):
-                        if var[j][ind_max[j]] > 0.5:  
-                            list_of_boxes.append(new_boxes[ind_max[j]])  
+                canon_boxes.append(augmented_boxes_list)
+                canon_scores.append(augmented_scores_list)
+                data_samples.append(data_batch['data_samples'][0])
 
-                    for j, list_of_scores in enumerate(canon_scores[i]):
-                        if var[j][ind_max[j]] > 0.5:  
-                            list_of_scores.append(pred_sample.pred_instances.scores[ind_max[j]])
+                final_sample = solo_evaluate(pred_sample, data_samples[i], evaluator)
 
-                    aug_boxes.append(list_of_boxes)
-                    aug_scores.append(list_of_scores)
-                  
-       
+                runner.call_hook('after_val_iter', 
+                    batch_idx=i, 
+                    data_batch=data_batch, 
+                    outputs=[final_sample])
+
+            else:
+                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, pred_sample.metainfo)
+                print(f"Invertida ({angle}°): {new_boxes[0, :2]}")
+                exit()
+                print(new_boxes)
+
+                var = IoU(canon_boxes[i], new_boxes)
+                ind_max = var.argmax(dim=1)
+                #Revisar a lógica por trás dos índices do var[j][ind_max[j]]
+                for j, list_of_boxes in enumerate(canon_boxes[i]):
+                    if var[j][ind_max[j]] > 0.5:  
+                        list_of_boxes.append(new_boxes[ind_max[j]])  
+
+                for j, list_of_scores in enumerate(canon_scores[i]):
+                    if var[j][ind_max[j]] > 0.5:  
+                        list_of_scores.append(pred_sample.pred_instances.scores[ind_max[j]])
+
+                aug_boxes.append(list_of_boxes)
+                aug_scores.append(list_of_scores)
+                
     
+
 
     metrics = evaluator.evaluate(len(dataloader.dataset))
     runner.call_hook('after_val_epoch', metrics=metrics)
@@ -121,8 +132,8 @@ def solo_evaluate(boxes, data_sample, evaluator):
     
     final_sample.ignored_instances = data_sample.ignored_instances
     final_sample.set_metainfo(data_sample.metainfo)
-    
 
+    
     evaluator.process(
     data_samples=[final_sample]
 )   
@@ -174,42 +185,31 @@ def merge_gaussian_boxes(g_boxes_list, all_scores_list):
     return mean_box, mean_score
     
 
-def invert_rotation(bboxes, angle, metainfo):
-    # 1. Recuperar metadados
-    # scale_factor costuma ser [scale_w, scale_h]
-    sc = metainfo.get('scale_factor', (1.0, 1.0))
-    sx, sy = sc[0], sc[1]
-    
-    angle_deg = float(metainfo.get('rotate_angle', 0))
+def invert_rotation(bboxes, angle_deg, metainfo):
+    # 1. Ângulo e Centro (O MMDet rotaciona a imagem redimensionada)
     angle_rad = angle_deg * (np.pi / 180.0)
     
+    # IMPORTANTE: Se o Resize ocorreu antes, o modelo já reescalou 
+    # as predições para a ori_shape. O centro deve ser da ori_shape.
+    h_ori, w_ori = metainfo['ori_shape'][:2]
+    cx, cy = w_ori / 2, h_ori / 2
     
-    h, w = metainfo['img_shape'][:2]
-    cx, cy = w / 2, h / 2
-    
-    # 3. Inverter Posição (x, y)
-    # Criamos a matriz de rotação INVERSA (ângulo negativo)
-    cos_a = np.cos(angle_rad)
-    sin_a = np.sin(angle_rad)
-    
+    # 2. Transladar para o centro
     x = bboxes[:, 0] - cx
     y = bboxes[:, 1] - cy
     
-    # Rotação do ponto (x, y) em torno da origem (agora cx, cy)
-    new_x = x * cos_a - y * sin_a + cx
-    new_y = x * sin_a + y * cos_a + cy
+    # 3. Rotação Inversa (Note o sinal negativo no ângulo para desfazer)
+    cos_a = np.cos(-angle_rad)
+    sin_a = np.sin(-angle_rad)
     
-    # 4. Inverter Escala
-    final_x = new_x / sx
-    final_y = new_y / sy
-    final_w = bboxes[:, 2] / sx
-    final_h = bboxes[:, 3] / sy
+    new_x = (x * cos_a - y * sin_a) + cx
+    new_y = (x * sin_a + y * cos_a) + cy
     
-    # 5. Inverter Orientação da Caixa (O ângulo theta)
-    # Se a imagem girou +45, a caixa precisa girar -45 para voltar ao normal
-    final_angle = bboxes[:, 4] - angle_rad
+    # 4. Ângulo da Caixa
+    # Se a imagem girou +X, a caixa precisa girar -X para voltar ao normal
+    new_angle = bboxes[:, 4] - angle_rad
     
-    return torch.stack([final_x, final_y, final_w, final_h, final_angle], dim=-1)
+    return torch.stack([new_x, new_y, bboxes[:, 2], bboxes[:, 3], new_angle], dim=-1)
 
 
 
@@ -225,12 +225,18 @@ def main():
     cfg.work_dir = 'work_dirs/tta_rotated_retinanet_test'
     cfg.load_from = 'checkpoint/rretinanet/epoch_72.pth'
 
-    
     runner = Runner.from_cfg(cfg)
-    
-    angles_to_test = [0]
 
-    run_tta(cfg, runner, angles_to_test)
+    runner.model.test_cfg.score_thr = 0.1
+
+    load_checkpoint(runner.model, cfg.load_from, map_location='cuda:0')
+
+    runner.model.eval()
+
+        
+    angles_for_aug= [0,45,90]
+
+    run_tta(cfg, runner, angles_for_aug)
     
     exit()
         
