@@ -65,8 +65,8 @@ def run_tta(cfg, runner, angles):
             with torch.no_grad():
                 outputs = runner.model.test_step(data_batch)
                 pred_sample = outputs[0]
-                if angle == 0:
-                    print(f"Base (0°): {pred_sample.pred_instances.bboxes[0, :2]}") # Centro da primeira detecção
+                # if angle == 0:
+                #     print(f"Base (0°): {pred_sample.pred_instances.bboxes[0, :2]}") # Centro da primeira detecção
 
 
             if(angle == 0):
@@ -79,12 +79,13 @@ def run_tta(cfg, runner, angles):
                 canon_scores.append(augmented_scores_list)
                 data_samples.append(data_batch['data_samples'][0])
 
-                final_sample = solo_evaluate(pred_sample, data_samples[i], evaluator)
+                if len(angles) == 1:
+                    final_sample = solo_evaluate(pred_sample, data_samples[i], evaluator, data_batch)
 
-                runner.call_hook('after_val_iter', 
-                    batch_idx=i, 
-                    data_batch=data_batch, 
-                    outputs=[final_sample])
+                    runner.call_hook('after_val_iter', 
+                        batch_idx=i, 
+                        data_batch=data_batch, 
+                        outputs=[final_sample])
 
             else:
                 new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, pred_sample.metainfo)
@@ -115,10 +116,14 @@ def run_tta(cfg, runner, angles):
     print('Finalizado')
     return True
 
-def solo_evaluate(boxes, data_sample, evaluator):
+def solo_evaluate(boxes, data_sample, evaluator, data_batch):
     final_boxes = boxes.pred_instances.bboxes
     final_score = boxes.pred_instances.scores
     final_label = boxes.pred_instances.labels
+
+    if final_boxes.shape[0] == 0:
+        print("Nenhuma detecção encontrada. Pulando avaliação.")
+        return None
 
     pred_instances = InstanceData(
         bboxes=final_boxes,    
@@ -129,13 +134,14 @@ def solo_evaluate(boxes, data_sample, evaluator):
     final_sample = DetDataSample()
     final_sample.pred_instances = pred_instances
     final_sample.gt_instances =  data_sample.gt_instances
-    
+
     final_sample.ignored_instances = data_sample.ignored_instances
     final_sample.set_metainfo(data_sample.metainfo)
 
     
     evaluator.process(
-    data_samples=[final_sample]
+    data_samples=[final_sample],
+    data_batch=data_batch
 )   
 
     return final_sample
@@ -227,14 +233,15 @@ def main():
 
     runner = Runner.from_cfg(cfg)
 
-    runner.model.test_cfg.score_thr = 0.1
+    runner.model.test_cfg.score_thr = 0.15
+    runner.model.test_cfg.nms.iou_threshold = 0.1
 
     load_checkpoint(runner.model, cfg.load_from, map_location='cuda:0')
 
     runner.model.eval()
 
         
-    angles_for_aug= [0,45,90]
+    angles_for_aug= [0,45]
 
     run_tta(cfg, runner, angles_for_aug)
     
