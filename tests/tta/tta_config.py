@@ -88,8 +88,7 @@ def run_tta(cfg, runner, angles):
                         outputs=[final_sample])
 
             else:
-                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, pred_sample.metainfo)
-                print(f"Invertida ({angle}°): {new_boxes[0, :2]}")
+                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, pred_sample.metainfo)                                                                                                                                                                                                                                                                                                      print(f"Invertida ({angle}°): {new_boxes[0, :2]}") 
                 exit()
                 print(new_boxes)
 
@@ -233,8 +232,8 @@ def main():
 
     runner = Runner.from_cfg(cfg)
 
-    runner.model.test_cfg.score_thr = 0.15
-    runner.model.test_cfg.nms.iou_threshold = 0.1
+    # runner.model.test_cfg.score_thr = 0.15
+    # runner.model.test_cfg.nms.iou_threshold = 0.1
 
     load_checkpoint(runner.model, cfg.load_from, map_location='cuda:0')
 
