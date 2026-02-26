@@ -17,6 +17,8 @@ from mmdet.structures import DetDataSample
 
 from mmrotate.utils import register_all_modules
 
+import torch.nn.functional as F
+
 
 
 def run_tta(cfg, runner, angles):
@@ -28,10 +30,6 @@ def run_tta(cfg, runner, angles):
 
 
     test_pipeline = cfg.val_pipeline
-    
-    test_pipeline.insert(-1, dict(type='Rotate', rotate_angle=angles[0]))
-
-    print(test_pipeline)
     
     
     dataloader.dataset.pipeline = Compose(test_pipeline)
@@ -47,9 +45,7 @@ def run_tta(cfg, runner, angles):
 
     canon_boxes = []
     canon_scores = []
-    aug_boxes = []
-    aug_scores = []
-    data_samples = []
+    all_tta_samples = []
 
     canonical_boxes = None
    
@@ -57,19 +53,16 @@ def run_tta(cfg, runner, angles):
     for i, data_batch in enumerate(dataloader):
         for angle in angles:
             print(f'Angulo: {angle}; Batch: {i}')
-
-            for transform in test_pipeline:
-                    if transform.get('type') == 'Rotate':
-                        transform['rotate_angle'] = angle
-                        dataloader.dataset.pipeline = Compose(test_pipeline)
-            with torch.no_grad():
-                outputs = runner.model.test_step(data_batch)
-                pred_sample = outputs[0]
-                # if angle == 0:
-                #     print(f"Base (0°): {pred_sample.pred_instances.bboxes[0, :2]}") # Centro da primeira detecção
+            batch_copy = data_batch.copy()
 
 
             if(angle == 0):
+                with torch.no_grad():
+                    outputs = runner.model.test_step(batch_copy)
+                    pred_sample = outputs[0]
+
+                    all_tta_samples.append(pred_sample)
+
                 canonical_boxes = pred_sample.pred_instances.bboxes
                 canonical_scores = pred_sample.pred_instances.scores
                 augmented_boxes_list = [[box] for box in canonical_boxes]
@@ -77,19 +70,18 @@ def run_tta(cfg, runner, angles):
 
                 canon_boxes.append(augmented_boxes_list)
                 canon_scores.append(augmented_scores_list)
-                data_samples.append(data_batch['data_samples'][0])
-
-                if len(angles) == 1:
-                    final_sample = solo_evaluate(pred_sample, data_samples[i], evaluator, data_batch)
-
-                    runner.call_hook('after_val_iter', 
-                        batch_idx=i, 
-                        data_batch=data_batch, 
-                        outputs=[final_sample])
+                
 
             else:
-                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, pred_sample.metainfo)                                                                                                                                                                                                                                                                                                      print(f"Invertida ({angle}°): {new_boxes[0, :2]}") 
+                img_tensor = batch_copy['inputs']  # [C, H, W]
+                # img_tensor = rotate_tensor(img_tensor.unsqueeze(0), angle)  # [1, C, H, W]
+                print(img_tensor)
                 exit()
+                
+
+                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, pred_sample.metainfo)                                                                                                                                                                                                                                                                                                      
+                print(f"Invertida ({angle}°): {new_boxes[0, :2]}") 
+                
                 print(new_boxes)
 
                 var = IoU(canon_boxes[i], new_boxes)
@@ -103,8 +95,7 @@ def run_tta(cfg, runner, angles):
                     if var[j][ind_max[j]] > 0.5:  
                         list_of_scores.append(pred_sample.pred_instances.scores[ind_max[j]])
 
-                aug_boxes.append(list_of_boxes)
-                aug_scores.append(list_of_scores)
+                
                 
     
 
@@ -115,38 +106,8 @@ def run_tta(cfg, runner, angles):
     print('Finalizado')
     return True
 
-def solo_evaluate(boxes, data_sample, evaluator, data_batch):
-    final_boxes = boxes.pred_instances.bboxes
-    final_score = boxes.pred_instances.scores
-    final_label = boxes.pred_instances.labels
 
-    if final_boxes.shape[0] == 0:
-        print("Nenhuma detecção encontrada. Pulando avaliação.")
-        return None
 
-    pred_instances = InstanceData(
-        bboxes=final_boxes,    
-        scores=final_score, 
-        labels=final_label         
-    )
-
-    final_sample = DetDataSample()
-    final_sample.pred_instances = pred_instances
-    final_sample.gt_instances =  data_sample.gt_instances
-
-    final_sample.ignored_instances = data_sample.ignored_instances
-    final_sample.set_metainfo(data_sample.metainfo)
-
-    
-    evaluator.process(
-    data_samples=[final_sample],
-    data_batch=data_batch
-)   
-
-    return final_sample
-
-def merge_n_evaluate(list_of_boxes):
-    exit()
 
 def merge_tta_output(bbox_list, scores_list):
     exit()
@@ -190,6 +151,29 @@ def merge_gaussian_boxes(g_boxes_list, all_scores_list):
     return mean_box, mean_score
     
 
+def rotate_tensor(img_tensor, angle_deg):
+    """
+    Rotaciona um tensor [B, C, H, W] em qualquer ângulo.
+    """
+    angle_rad = torch.tensor(angle_deg * (np.pi / 180.0))
+    device = img_tensor.device
+    
+    # Matriz de rotação 2D
+    # [ cos -sin 0 ]
+    # [ sin  cos 0 ]
+    rotation_matrix = torch.tensor([
+        [torch.cos(angle_rad), -torch.sin(angle_rad), 0],
+        [torch.sin(angle_rad),  torch.cos(angle_rad), 0]
+    ], device=device).unsqueeze(0) # Shape [1, 2, 3]
+
+    # Criar a grade (grid) para a transformação
+    grid = F.affine_grid(rotation_matrix, img_tensor.size(), align_corners=False)
+    
+    # Aplicar a rotação com interpolação bilinear
+    rotated_img = F.grid_sample(img_tensor, grid, align_corners=False, mode='bilinear')
+    
+    return rotated_img
+
 def invert_rotation(bboxes, angle_deg, metainfo):
     # 1. Ângulo e Centro (O MMDet rotaciona a imagem redimensionada)
     angle_rad = angle_deg * (np.pi / 180.0)
@@ -217,7 +201,35 @@ def invert_rotation(bboxes, angle_deg, metainfo):
     return torch.stack([new_x, new_y, bboxes[:, 2], bboxes[:, 3], new_angle], dim=-1)
 
 
+# def solo_evaluate(boxes, data_sample, evaluator, data_batch):
+#     final_boxes = boxes.pred_instances.bboxes
+#     final_score = boxes.pred_instances.scores
+#     final_label = boxes.pred_instances.labels
 
+#     if final_boxes.shape[0] == 0:
+#         print("Nenhuma detecção encontrada. Pulando avaliação.")
+#         return None
+
+#     pred_instances = InstanceData(
+#         bboxes=final_boxes,    
+#         scores=final_score, 
+#         labels=final_label         
+#     )
+
+#     final_sample = DetDataSample()
+#     final_sample.pred_instances = pred_instances
+#     final_sample.gt_instances =  data_sample.gt_instances
+
+#     final_sample.ignored_instances = data_sample.ignored_instances
+#     final_sample.set_metainfo(data_sample.metainfo)
+
+    
+#     evaluator.process(
+#     data_samples=[final_sample],
+#     data_batch=data_batch
+# )   
+
+#     return final_sample
 
 
 def main():
@@ -225,7 +237,7 @@ def main():
     register_all_modules_mmdet(init_default_scope=False)
     register_all_modules(init_default_scope=False)
 
-    config_path = 'configs/rotated_retinanet/rotated_retinanet_hbb_r50_fpn_6x_hrsc_rr_oc.py'
+    config_path = 'configs/rotated_retinanet/rotated-retinanet-hbox-oc_r50_fpn_rr-6x_hrsc.py'
     cfg = Config.fromfile(config_path)
     cfg.work_dir = 'work_dirs/tta_rotated_retinanet_test'
     cfg.load_from = 'checkpoint/rretinanet/epoch_72.pth'
