@@ -1,15 +1,24 @@
 import mmcv
+from mmcv import imrotate
+from mmcv.ops import box_iou_rotated as IoU
+
 from mmengine.config import Config
 from mmengine.runner import Runner
 from mmengine.dataset import Compose
+
 from typing import Dict
 from mmengine.logging import HistoryBuffer
 import torch
 import numpy as np
 import gaussian_conv as gc
-from mmcv.ops import box_iou_rotated as IoU
+
+from math import sqrt, ceil, floor
+
+import cv2
 
 from mmdet.utils import register_all_modules as register_all_modules_mmdet
+
+from typing import List, Optional, Tuple, Union, no_type_check
 
 from mmengine.structures import InstanceData
 from mmengine.runner import load_checkpoint
@@ -45,7 +54,7 @@ def run_tta(cfg, runner, angles):
 
     canon_boxes = []
     canon_scores = []
-    all_tta_samples = []
+    
 
     canonical_boxes = None
    
@@ -56,46 +65,66 @@ def run_tta(cfg, runner, angles):
             batch_copy = data_batch.copy()
 
 
-            if(angle == 0):
+            if(angle == 1):
                 with torch.no_grad():
                     outputs = runner.model.test_step(batch_copy)
                     pred_sample = outputs[0]
 
-                    all_tta_samples.append(pred_sample)
+                    
 
-                canonical_boxes = pred_sample.pred_instances.bboxes
-                canonical_scores = pred_sample.pred_instances.scores
-                augmented_boxes_list = [[box] for box in canonical_boxes]
-                augmented_scores_list = [[score] for score in canonical_scores]
+                # canonical_boxes = pred_sample.pred_instances.bboxes
+                # canonical_scores = pred_sample.pred_instances.scores
+                # augmented_boxes_list = [[box] for box in canonical_boxes]
+                # augmented_scores_list = [[score] for score in canonical_scores]
 
-                canon_boxes.append(augmented_boxes_list)
-                canon_scores.append(augmented_scores_list)
+                # canon_boxes.append(augmented_boxes_list)
+                # canon_scores.append(augmented_scores_list)
                 
 
             else:
-                img_tensor = batch_copy['inputs']  # [C, H, W]
-                # img_tensor = rotate_tensor(img_tensor.unsqueeze(0), angle)  # [1, C, H, W]
-                print(img_tensor)
-                exit()
+                metainfo = batch_copy['data_samples'][0].metainfo
+                img = batch_copy['inputs'][0].permute(1,2,0)
                 
+                h,w = metainfo['img_shape'][0:2]
+                diagonal = sqrt(h*h + w*w)
+                diagonal = ceil(diagonal)
 
-                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, pred_sample.metainfo)                                                                                                                                                                                                                                                                                                      
-                print(f"Invertida ({angle}°): {new_boxes[0, :2]}") 
+                pad_top = floor((diagonal-h)/2)
+                pad_left = floor((diagonal-w)/2)
+                r_image = mmcv.image.impad(img = img.cpu().numpy(), padding=(pad_left, pad_top))
+                shape = r_image.shape
+                r_image = mmcv.imrotate(img = r_image, angle = angle)
+                mmcv.imwrite(r_image, f'tests/tta/images/{angle}.jpg')
                 
-                print(new_boxes)
+                r_image=img.new_tensor(r_image).permute(2,0,1)
+                batch_copy['inputs'][0] = r_image
 
-                var = IoU(canon_boxes[i], new_boxes)
-                ind_max = var.argmax(dim=1)
-                #Revisar a lógica por trás dos índices do var[j][ind_max[j]]
-                for j, list_of_boxes in enumerate(canon_boxes[i]):
-                    if var[j][ind_max[j]] > 0.5:  
-                        list_of_boxes.append(new_boxes[ind_max[j]])  
-
-                for j, list_of_scores in enumerate(canon_scores[i]):
-                    if var[j][ind_max[j]] > 0.5:  
-                        list_of_scores.append(pred_sample.pred_instances.scores[ind_max[j]])
-
+                outputs = runner.model.test_step(batch_copy)  
+                pred_sample = outputs[0]
+                #Tentando realocar as caixas para a posição original (sem sucesso em achar o valor do deslocamento/ rotação ok.)
+                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, shape, padding=(pad_left, pad_top))
+               
+                draw_rotated_boxes(img.cpu().numpy(), new_boxes, f'tests/tta/images/check2_{angle}.jpg')                                                                                                                                                                                                                                                                                                      
+                pred_sample.pred_instances.bboxes = new_boxes
                 
+                
+                # var = IoU(canon_boxes[i], new_boxes)
+                # ind_max = var.argmax(dim=1)
+                # #Revisar a lógica por trás dos índices do var[j][ind_max[j]]
+                # for j, list_of_boxes in enumerate(canon_boxes[i]):
+                #     if var[j][ind_max[j]] > 0.5:  
+                #         list_of_boxes.append(new_boxes[ind_max[j]])  
+
+                # for j, list_of_scores in enumerate(canon_scores[i]):
+                #     if var[j][ind_max[j]] > 0.5:  
+                #         list_of_scores.append(pred_sample.pred_instances.scores[ind_max[j]])
+        if len(angles) == 1:
+            evaluator.process(
+            data_samples=[pred_sample],
+            data_batch=data_batch
+            )
+        # else:
+        #     #evaluator.process utilizando as samples mescladas das variações de angulos          
                 
     
 
@@ -107,6 +136,51 @@ def run_tta(cfg, runner, angles):
     return True
 
 
+
+def invert_rotation(bboxes, angle_deg, pad_shape, padding):
+
+    angle_rad = angle_deg * (np.pi / 180.0)
+    
+    
+    w_pad, h_pad = pad_shape[:2]
+    cx, cy = floor(w_pad / 2), floor(h_pad / 2)
+    
+   
+    x = bboxes[:, 0] - cx
+    y = bboxes[:, 1] - cy
+    
+
+    cos_a = np.cos(-angle_rad)
+    sin_a = np.sin(-angle_rad)
+    
+    new_x = (x * cos_a - y * sin_a) + cx
+    new_y = (x * sin_a + y * cos_a) + cy
+
+    
+    new_x = new_x - padding[0]
+    new_y = new_y - padding[1]
+
+    new_angle = bboxes[:, 4] - angle_rad
+    
+    return torch.stack([new_x, new_y, bboxes[:, 2], bboxes[:, 3], new_angle], dim=-1)
+
+
+def draw_rotated_boxes(img, bboxes, save_path):
+    # img: numpy array (H, W, 3)
+    # bboxes: tensor ou array no formato [cx, cy, w, h, angle_rad]
+    img_canvas = img.copy()
+    for box in bboxes:
+        cx, cy, w, h, angle = box.tolist()
+        
+        # Converter para o formato que o OpenCV entende (graus)
+        rect = ((cx, cy), (w, h), angle * 180 / np.pi)
+        box_pts = cv2.boxPoints(rect)
+        box_pts = np.int0(box_pts)
+        
+        # Desenhar o polígono
+        cv2.drawContours(img_canvas, [box_pts], 0, (0, 255, 0), 2)
+        
+    cv2.imwrite(save_path, img_canvas)
 
 
 def merge_tta_output(bbox_list, scores_list):
@@ -149,56 +223,38 @@ def merge_gaussian_boxes(g_boxes_list, all_scores_list):
     mean_score = all_scores.mean(dim=0, keepdim=True)
 
     return mean_box, mean_score
-    
 
-def rotate_tensor(img_tensor, angle_deg):
-    """
-    Rotaciona um tensor [B, C, H, W] em qualquer ângulo.
-    """
-    angle_rad = torch.tensor(angle_deg * (np.pi / 180.0))
-    device = img_tensor.device
-    
-    # Matriz de rotação 2D
-    # [ cos -sin 0 ]
-    # [ sin  cos 0 ]
-    rotation_matrix = torch.tensor([
-        [torch.cos(angle_rad), -torch.sin(angle_rad), 0],
-        [torch.sin(angle_rad),  torch.cos(angle_rad), 0]
-    ], device=device).unsqueeze(0) # Shape [1, 2, 3]
 
-    # Criar a grade (grid) para a transformação
-    grid = F.affine_grid(rotation_matrix, img_tensor.size(), align_corners=False)
-    
-    # Aplicar a rotação com interpolação bilinear
-    rotated_img = F.grid_sample(img_tensor, grid, align_corners=False, mode='bilinear')
-    
-    return rotated_img
 
-def invert_rotation(bboxes, angle_deg, metainfo):
-    # 1. Ângulo e Centro (O MMDet rotaciona a imagem redimensionada)
-    angle_rad = angle_deg * (np.pi / 180.0)
+def main():
+
+    register_all_modules_mmdet(init_default_scope=False)
+    register_all_modules(init_default_scope=False)
+
+    config_path = 'configs/rotated_retinanet/rotated-retinanet-hbox-oc_r50_fpn_rr-6x_hrsc.py'
+    cfg = Config.fromfile(config_path)
+    cfg.work_dir = 'work_dirs/tta_rotated_retinanet_test'
+    cfg.load_from = 'checkpoint/rretinanet/epoch_72.pth'
+
+    runner = Runner.from_cfg(cfg)
+
+    # runner.model.test_cfg.score_thr = 0.15
+    # runner.model.test_cfg.nms.iou_threshold = 0.1
+
+    load_checkpoint(runner.model, cfg.load_from, map_location='cuda:0')
+
+    runner.model.eval()
+
+        
+    angles_for_aug= [45]
+
+    run_tta(cfg, runner, angles_for_aug)
     
-    # IMPORTANTE: Se o Resize ocorreu antes, o modelo já reescalou 
-    # as predições para a ori_shape. O centro deve ser da ori_shape.
-    h_ori, w_ori = metainfo['ori_shape'][:2]
-    cx, cy = w_ori / 2, h_ori / 2
-    
-    # 2. Transladar para o centro
-    x = bboxes[:, 0] - cx
-    y = bboxes[:, 1] - cy
-    
-    # 3. Rotação Inversa (Note o sinal negativo no ângulo para desfazer)
-    cos_a = np.cos(-angle_rad)
-    sin_a = np.sin(-angle_rad)
-    
-    new_x = (x * cos_a - y * sin_a) + cx
-    new_y = (x * sin_a + y * cos_a) + cy
-    
-    # 4. Ângulo da Caixa
-    # Se a imagem girou +X, a caixa precisa girar -X para voltar ao normal
-    new_angle = bboxes[:, 4] - angle_rad
-    
-    return torch.stack([new_x, new_y, bboxes[:, 2], bboxes[:, 3], new_angle], dim=-1)
+    exit()
+        
+
+if __name__ == '__main__':
+    main()
 
 
 # def solo_evaluate(boxes, data_sample, evaluator, data_batch):
@@ -230,36 +286,3 @@ def invert_rotation(bboxes, angle_deg, metainfo):
 # )   
 
 #     return final_sample
-
-
-def main():
-
-    register_all_modules_mmdet(init_default_scope=False)
-    register_all_modules(init_default_scope=False)
-
-    config_path = 'configs/rotated_retinanet/rotated-retinanet-hbox-oc_r50_fpn_rr-6x_hrsc.py'
-    cfg = Config.fromfile(config_path)
-    cfg.work_dir = 'work_dirs/tta_rotated_retinanet_test'
-    cfg.load_from = 'checkpoint/rretinanet/epoch_72.pth'
-
-    runner = Runner.from_cfg(cfg)
-
-    # runner.model.test_cfg.score_thr = 0.15
-    # runner.model.test_cfg.nms.iou_threshold = 0.1
-
-    load_checkpoint(runner.model, cfg.load_from, map_location='cuda:0')
-
-    runner.model.eval()
-
-        
-    angles_for_aug= [0,45]
-
-    run_tta(cfg, runner, angles_for_aug)
-    
-    exit()
-        
-
-if __name__ == '__main__':
-    main()
-
-
