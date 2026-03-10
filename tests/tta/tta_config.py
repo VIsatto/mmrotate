@@ -16,6 +16,8 @@ from math import sqrt, ceil, floor
 
 import cv2
 
+from copy import deepcopy
+
 from mmdet.utils import register_all_modules as register_all_modules_mmdet
 
 from typing import List, Optional, Tuple, Union, no_type_check
@@ -86,28 +88,37 @@ def run_tta(cfg, runner, angles):
                 img = batch_copy['inputs'][0].permute(1,2,0)
                 
                 h,w = metainfo['img_shape'][0:2]
-                diagonal = sqrt(h*h + w*w)
-                diagonal = ceil(diagonal)
+                # diagonal = sqrt(h*h + w*w)
+                # diagonal = ceil(diagonal)
 
-                pad_top = floor((diagonal-h)/2)
-                pad_left = floor((diagonal-w)/2)
-                r_image = mmcv.image.impad(img = img.cpu().numpy(), padding=(pad_left, pad_top))
-                shape = r_image.shape
-                r_image = mmcv.imrotate(img = r_image, angle = angle)
-                mmcv.imwrite(r_image, f'tests/tta/images/{angle}.jpg')
+                # pad_top = floor((diagonal-h)/2)
+                # pad_left = floor((diagonal-w)/2)
+
+                # r_image = mmcv.image.impad(img = img.cpu().numpy(), padding=(pad_left, pad_top))
                 
-                r_image=img.new_tensor(r_image).permute(2,0,1)
+                r_image = mmcv.imrotate(img = img.cpu().numpy(), angle = angle)
+                
+
+                r_image= img.new_tensor(r_image).permute(2,0,1)
+
                 batch_copy['inputs'][0] = r_image
+                # batch_copy['data_samples'][0].set_metainfo({
+                #     'pad_shape': shape[:2],
+                #     # 'scale_factor': (1.0, 1.0)
+                # })
 
-                outputs = runner.model.test_step(batch_copy)  
+
+                outputs = runner.model.test_step(batch_copy)
+                
                 pred_sample = outputs[0]
-                #Tentando realocar as caixas para a posição original (sem sucesso em achar o valor do deslocamento/ rotação ok.)
-                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, shape, padding=(pad_left, pad_top))
                
-                draw_rotated_boxes(img.cpu().numpy(), new_boxes, f'tests/tta/images/check2_{angle}.jpg')                                                                                                                                                                                                                                                                                                      
+                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, metainfo['ori_shape'])
+               
+                                                                                                                                                                                                                                                                                                                      
                 pred_sample.pred_instances.bboxes = new_boxes
-                
-                
+
+
+
                 # var = IoU(canon_boxes[i], new_boxes)
                 # ind_max = var.argmax(dim=1)
                 # #Revisar a lógica por trás dos índices do var[j][ind_max[j]]
@@ -118,6 +129,15 @@ def run_tta(cfg, runner, angles):
                 # for j, list_of_scores in enumerate(canon_scores[i]):
                 #     if var[j][ind_max[j]] > 0.5:  
                 #         list_of_scores.append(pred_sample.pred_instances.scores[ind_max[j]])
+        
+
+        # print(f"DEBUG - Pred Box 0: {pred_sample.pred_instances.bboxes[0]}")
+        # print(f"DEBUG - Pred Metainfo Shape: {pred_sample.metainfo['img_shape']}")
+        # # Se possível, imprima uma box do Ground Truth para comparar
+        # if 'gt_instances' in data_batch['data_samples'][0]:
+        #     print(f"DEBUG - GT Box 0: {data_batch['data_samples'][0].gt_instances.bboxes[0]}")
+
+        # exit()
         if len(angles) == 1:
             evaluator.process(
             data_samples=[pred_sample],
@@ -137,12 +157,12 @@ def run_tta(cfg, runner, angles):
 
 
 
-def invert_rotation(bboxes, angle_deg, pad_shape, padding):
+def invert_rotation(bboxes, angle_deg, shape):
 
     angle_rad = angle_deg * (np.pi / 180.0)
     
     
-    w_pad, h_pad = pad_shape[:2]
+    h_pad, w_pad = shape[:2]
     cx, cy = floor(w_pad / 2), floor(h_pad / 2)
     
    
@@ -156,28 +176,22 @@ def invert_rotation(bboxes, angle_deg, pad_shape, padding):
     new_x = (x * cos_a - y * sin_a) + cx
     new_y = (x * sin_a + y * cos_a) + cy
 
-    
-    new_x = new_x - padding[0]
-    new_y = new_y - padding[1]
-
+   
     new_angle = bboxes[:, 4] - angle_rad
     
     return torch.stack([new_x, new_y, bboxes[:, 2], bboxes[:, 3], new_angle], dim=-1)
 
 
 def draw_rotated_boxes(img, bboxes, save_path):
-    # img: numpy array (H, W, 3)
-    # bboxes: tensor ou array no formato [cx, cy, w, h, angle_rad]
+   
     img_canvas = img.copy()
     for box in bboxes:
         cx, cy, w, h, angle = box.tolist()
         
-        # Converter para o formato que o OpenCV entende (graus)
         rect = ((cx, cy), (w, h), angle * 180 / np.pi)
         box_pts = cv2.boxPoints(rect)
         box_pts = np.int0(box_pts)
         
-        # Desenhar o polígono
         cv2.drawContours(img_canvas, [box_pts], 0, (0, 255, 0), 2)
         
     cv2.imwrite(save_path, img_canvas)
@@ -191,35 +205,25 @@ def merge_tta_output(bbox_list, scores_list):
         return final_bboxes, final_scores
 
 def merge_gaussian_boxes(g_boxes_list, all_scores_list):
-    # g_boxes_list: lista de tensores [N_i, 5]
-    # all_scores_list: lista de tensores [N_i]
+   
     
     if len(g_boxes_list) == 1:
         return g_boxes_list[0], all_scores_list[0]
 
-    # 1. Concatenar tudo para processar em lote (batch)
-    # Isso transforma as listas em tensores únicos [Total_N, 5] e [Total_N]
+    
     all_boxes = torch.cat(g_boxes_list, dim=0)
     all_scores = torch.cat(all_scores_list, dim=0)
-    weights = all_scores.view(-1, 1) # Shape [Total_N, 1] para multiplicar
+    weights = all_scores.view(-1, 1) 
 
-    # 2. Converter caixas rotacionadas para parâmetros Gaussianos
-    # Assumindo que gc.rbbox_to_gaussian aceite o tensor completo
     g_params = gc.rbbox_to_gaussian(all_boxes, scalar=1.0) 
 
-    # 3. Calcular a Média Ponderada
-    # Multiplicamos os parâmetros pelo peso (score)
     weighted_params = g_params * weights
     
-    # Soma dos parâmetros ponderados dividida pela soma dos pesos
-    # dim=0 calcula a média entre todas as detecções existentes
-    sum_weights = weights.sum(dim=0) + 1e-6 # Evita divisão por zero
+
     mean_param = weighted_params.sum(dim=0, keepdim=True) / sum_weights
 
-    # 4. Converter de volta para formato rbbox (x, y, w, h, angle)
     mean_box = gc.gaussian_to_rbbox(mean_param, scalar_div=1.0)
     
-    # 5. Score médio final
     mean_score = all_scores.mean(dim=0, keepdim=True)
 
     return mean_box, mean_score
@@ -238,9 +242,6 @@ def main():
 
     runner = Runner.from_cfg(cfg)
 
-    # runner.model.test_cfg.score_thr = 0.15
-    # runner.model.test_cfg.nms.iou_threshold = 0.1
-
     load_checkpoint(runner.model, cfg.load_from, map_location='cuda:0')
 
     runner.model.eval()
@@ -257,32 +258,3 @@ if __name__ == '__main__':
     main()
 
 
-# def solo_evaluate(boxes, data_sample, evaluator, data_batch):
-#     final_boxes = boxes.pred_instances.bboxes
-#     final_score = boxes.pred_instances.scores
-#     final_label = boxes.pred_instances.labels
-
-#     if final_boxes.shape[0] == 0:
-#         print("Nenhuma detecção encontrada. Pulando avaliação.")
-#         return None
-
-#     pred_instances = InstanceData(
-#         bboxes=final_boxes,    
-#         scores=final_score, 
-#         labels=final_label         
-#     )
-
-#     final_sample = DetDataSample()
-#     final_sample.pred_instances = pred_instances
-#     final_sample.gt_instances =  data_sample.gt_instances
-
-#     final_sample.ignored_instances = data_sample.ignored_instances
-#     final_sample.set_metainfo(data_sample.metainfo)
-
-    
-#     evaluator.process(
-#     data_samples=[final_sample],
-#     data_batch=data_batch
-# )   
-
-#     return final_sample
