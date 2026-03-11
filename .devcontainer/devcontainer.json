@@ -8,7 +8,7 @@
     "mounts": [
       //"source=${localWorkspaceFolder}/data/DOTA,target=${containerWorkspaceFolder}/data/DOTA,type=bind,consistency=cached",
       //"source=${localWorkspaceFolder}/data/DIOR,target=${containerWorkspaceFolder}/data/DIOR,type=bind,consistency=cached",
-      "source=${localWorkspaceFolder}/data/HRSC2016,target=${containerWorkspaceFolder}/data/hrsc,type=bind,consistency=cached"
+      "source=/home/data/Datasets/HRSC2016,target=${containerWorkspaceFolder}/data/hrsc,type=bind,consistency=cached"
     ],
     "customizations": {
         "vscode": {
