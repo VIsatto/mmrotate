@@ -54,98 +54,82 @@ def run_tta(cfg, runner, angles):
     runner.call_hook('before_test')
     runner.call_hook('before_test_epoch')
 
-    canon_boxes = []
-    canon_scores = []
     
-
-    canonical_boxes = None
+    
    
 
     for i, data_batch in enumerate(dataloader):
+        augmented_boxes = []
+        all_scores = []
+        print(f'Batch: {i}')
         for angle in angles:
-            print(f'Angulo: {angle}; Batch: {i}')
             batch_copy = data_batch.copy()
 
 
-            if(angle == 1):
-                with torch.no_grad():
-                    outputs = runner.model.test_step(batch_copy)
-                    pred_sample = outputs[0]
+            if(angle == 0):
+                outputs = runner.model.test_step(batch_copy)
+                pred_sample = outputs[0]
 
-                    
-
-                # canonical_boxes = pred_sample.pred_instances.bboxes
-                # canonical_scores = pred_sample.pred_instances.scores
-                # augmented_boxes_list = [[box] for box in canonical_boxes]
-                # augmented_scores_list = [[score] for score in canonical_scores]
-
-                # canon_boxes.append(augmented_boxes_list)
-                # canon_scores.append(augmented_scores_list)
+                
+                augmented_boxes.append(pred_sample.pred_instances.bboxes)
+                all_scores.append(pred_sample.pred_instances.scores)
+                
                 
 
             else:
                 metainfo = batch_copy['data_samples'][0].metainfo
                 img = batch_copy['inputs'][0].permute(1,2,0)
-                
-                h,w = metainfo['img_shape'][0:2]
-                # diagonal = sqrt(h*h + w*w)
-                # diagonal = ceil(diagonal)
+               
 
-                # pad_top = floor((diagonal-h)/2)
-                # pad_left = floor((diagonal-w)/2)
-
-                # r_image = mmcv.image.impad(img = img.cpu().numpy(), padding=(pad_left, pad_top))
-                
                 r_image = mmcv.imrotate(img = img.cpu().numpy(), angle = angle)
                 
-
                 r_image= img.new_tensor(r_image).permute(2,0,1)
 
                 batch_copy['inputs'][0] = r_image
-                # batch_copy['data_samples'][0].set_metainfo({
-                #     'pad_shape': shape[:2],
-                #     # 'scale_factor': (1.0, 1.0)
-                # })
-
 
                 outputs = runner.model.test_step(batch_copy)
                 
                 pred_sample = outputs[0]
-               
-                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, metainfo['ori_shape'])
-               
-                                                                                                                                                                                                                                                                                                                      
-                pred_sample.pred_instances.bboxes = new_boxes
-
-
-
-                # var = IoU(canon_boxes[i], new_boxes)
-                # ind_max = var.argmax(dim=1)
-                # #Revisar a lógica por trás dos índices do var[j][ind_max[j]]
-                # for j, list_of_boxes in enumerate(canon_boxes[i]):
-                #     if var[j][ind_max[j]] > 0.5:  
-                #         list_of_boxes.append(new_boxes[ind_max[j]])  
-
-                # for j, list_of_scores in enumerate(canon_scores[i]):
-                #     if var[j][ind_max[j]] > 0.5:  
-                #         list_of_scores.append(pred_sample.pred_instances.scores[ind_max[j]])
-        
-
-        # print(f"DEBUG - Pred Box 0: {pred_sample.pred_instances.bboxes[0]}")
-        # print(f"DEBUG - Pred Metainfo Shape: {pred_sample.metainfo['img_shape']}")
-        # # Se possível, imprima uma box do Ground Truth para comparar
-        # if 'gt_instances' in data_batch['data_samples'][0]:
-        #     print(f"DEBUG - GT Box 0: {data_batch['data_samples'][0].gt_instances.bboxes[0]}")
-
-        # exit()
-        if len(angles) == 1:
-            evaluator.process(
-            data_samples=[pred_sample],
-            data_batch=data_batch
-            )
-        # else:
-        #     #evaluator.process utilizando as samples mescladas das variações de angulos          
                 
+                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, metainfo['ori_shape'])
+                
+                augmented_boxes.append(new_boxes)
+                all_scores.append(pred_sample.pred_instances.scores)
+
+        augmented_boxes = torch.cat(augmented_boxes)
+        all_scores = torch.cat(all_scores)
+        sorted_scores = torch.sort(all_scores, descending=True)
+        augmented_boxes = augmented_boxes[sorted_scores.indices]
+        iou_trh = 0.5
+        iou_matrix = IoU(augmented_boxes, augmented_boxes)
+        iou_matrix = iou_matrix.triu(diagonal=1)
+        iou_matrix[iou_matrix>=iou_trh] = 1.0
+        iou_matrix[iou_matrix<iou_trh] = 0.0
+        solo_ind = iou_matrix.sum(dim=0)==0
+        iou_matrix.fill_diagonal_(1.0)
+        iou_matrix = iou_matrix[solo_ind]
+        
+        final_boxes, final_scores= merge_gaussian_boxes(augmented_boxes,iou_matrix,sorted_scores)
+        
+        
+        
+        new_instances = InstanceData()
+        new_instances.bboxes = final_boxes  # Agora com tamanho 10
+        new_instances.scores = final_scores # Agora com tamanho 10
+        new_instances.labels = torch.zeros(len(final_boxes), dtype=torch.long, device=final_boxes.device)
+        
+        # Se você tiver labels, lembre-se que eles também precisam ter tamanho 10
+        # new_instances.labels = final_labels 
+
+        # Substitui as instâncias antigas pelas novas no pred_sample
+        pred_sample.pred_instances = new_instances
+        
+      
+        evaluator.process(
+        data_samples=[pred_sample],
+        data_batch=data_batch
+        )
+        
     
 
 
@@ -204,29 +188,32 @@ def merge_tta_output(bbox_list, scores_list):
         final_bboxes, final_scores = self.merge_gaussian_boxes(bbox_list[i], scores_list[i])
         return final_bboxes, final_scores
 
-def merge_gaussian_boxes(g_boxes_list, all_scores_list):
+def merge_gaussian_boxes(all_boxes, iou_matrix ,sorted_scores):
    
+    final_gaus = []
+    final_scores= []
+    final_boxes = []
+
+    g_params = gc.rbbox_to_gaussian(all_boxes, scalar=1.0)
+
+    aggregation_list = g_params.unsqueeze(0) * iou_matrix.unsqueeze(-1)
+
+    for i, list in enumerate(aggregation_list):
+        num_boxes = iou_matrix[i].sum(dim=0)
+        if (num_boxes.item()>1):
+            ind = list.sum(dim=1) > 1
+            final_scores.append(sorted_scores.values[ind].max())
+            final_gaus.append(list.sum(dim=0)/num_boxes)
+
+        else:
+            ind = list.sum(dim=1) > 1
+            final_scores.append(sorted_scores.values[ind].max())
+            final_gaus.append(list.sum(dim=0))   
     
-    if len(g_boxes_list) == 1:
-        return g_boxes_list[0], all_scores_list[0]
+    for tensor in final_gaus:
+        final_boxes.append(gc.gaussian_to_rbbox(tensor, 1.0))
 
-    
-    all_boxes = torch.cat(g_boxes_list, dim=0)
-    all_scores = torch.cat(all_scores_list, dim=0)
-    weights = all_scores.view(-1, 1) 
-
-    g_params = gc.rbbox_to_gaussian(all_boxes, scalar=1.0) 
-
-    weighted_params = g_params * weights
-    
-
-    mean_param = weighted_params.sum(dim=0, keepdim=True) / sum_weights
-
-    mean_box = gc.gaussian_to_rbbox(mean_param, scalar_div=1.0)
-    
-    mean_score = all_scores.mean(dim=0, keepdim=True)
-
-    return mean_box, mean_score
+    return torch.stack(final_boxes), torch.stack(final_scores)
 
 
 
@@ -247,11 +234,11 @@ def main():
     runner.model.eval()
 
         
-    angles_for_aug= [45]
+    angles_for_aug= [360]
 
     run_tta(cfg, runner, angles_for_aug)
     
-    exit()
+    
         
 
 if __name__ == '__main__':
