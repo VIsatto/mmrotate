@@ -99,16 +99,30 @@ def run_tta(cfg, runner, angles):
         augmented_boxes = torch.cat(augmented_boxes)
         all_scores = torch.cat(all_scores)
         sorted_scores = torch.sort(all_scores, descending=True)
+
         augmented_boxes = augmented_boxes[sorted_scores.indices]
         iou_trh = 0.5
         iou_matrix = IoU(augmented_boxes, augmented_boxes)
+        # filtrar minimo de n/2 1's por linha quando tiver n caixas
+
         iou_matrix = iou_matrix.triu(diagonal=1)
         iou_matrix[iou_matrix>=iou_trh] = 1.0
         iou_matrix[iou_matrix<iou_trh] = 0.0
+        
         solo_ind = iou_matrix.sum(dim=0)==0
+        
         iou_matrix.fill_diagonal_(1.0)
+        
         iou_matrix = iou_matrix[solo_ind]
         
+        valid_ind = iou_matrix.sum(dim=1)>=ceil(len(angles)/2)
+        
+        iou_matrix = iou_matrix[valid_ind]
+       
+
+        if iou_matrix.size()[0] == 0 :
+            continue
+
         final_boxes, final_scores= merge_gaussian_boxes(augmented_boxes,iou_matrix,sorted_scores)
         
         
@@ -180,24 +194,16 @@ def draw_rotated_boxes(img, bboxes, save_path):
         
     cv2.imwrite(save_path, img_canvas)
 
-
-def merge_tta_output(bbox_list, scores_list):
-    exit()
-    for i in range (len(bbox_list)):
-        print(bbox_list[i])
-        final_bboxes, final_scores = self.merge_gaussian_boxes(bbox_list[i], scores_list[i])
-        return final_bboxes, final_scores
-
 def merge_gaussian_boxes(all_boxes, iou_matrix ,sorted_scores):
-   
+    
     final_gaus = []
     final_scores= []
     final_boxes = []
 
     g_params = gc.rbbox_to_gaussian(all_boxes, scalar=1.0)
-
+    
     aggregation_list = g_params.unsqueeze(0) * iou_matrix.unsqueeze(-1)
-
+   
     for i, list in enumerate(aggregation_list):
         num_boxes = iou_matrix[i].sum(dim=0)
         if (num_boxes.item()>1):
@@ -212,7 +218,7 @@ def merge_gaussian_boxes(all_boxes, iou_matrix ,sorted_scores):
     
     for tensor in final_gaus:
         final_boxes.append(gc.gaussian_to_rbbox(tensor, 1.0))
-
+    
     return torch.stack(final_boxes), torch.stack(final_scores)
 
 
@@ -234,7 +240,7 @@ def main():
     runner.model.eval()
 
         
-    angles_for_aug= [360]
+    angles_for_aug= [0,45]
 
     run_tta(cfg, runner, angles_for_aug)
     
