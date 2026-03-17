@@ -64,7 +64,7 @@ def run_tta(cfg, runner, angles):
         print(f'Batch: {i}')
         for angle in angles:
             batch_copy = data_batch.copy()
-
+            
 
             if(angle == 0):
                 outputs = runner.model.test_step(batch_copy)
@@ -79,66 +79,68 @@ def run_tta(cfg, runner, angles):
             else:
                 metainfo = batch_copy['data_samples'][0].metainfo
                 img = batch_copy['inputs'][0].permute(1,2,0)
-               
+                
 
                 r_image = mmcv.imrotate(img = img.cpu().numpy(), angle = angle)
-                
+                new_img = r_image
                 r_image= img.new_tensor(r_image).permute(2,0,1)
-
                 batch_copy['inputs'][0] = r_image
-
                 outputs = runner.model.test_step(batch_copy)
                 
                 pred_sample = outputs[0]
-                
+                # draw_rotated_boxes(new_img, pred_sample.pred_instances.bboxes, f'tests/tta/images/{angle}check.jpg')
+                if len(pred_sample.pred_instances.bboxes) == 0:
+                    continue
+
                 new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, metainfo['ori_shape'])
                 
                 augmented_boxes.append(new_boxes)
                 all_scores.append(pred_sample.pred_instances.scores)
 
-        augmented_boxes = torch.cat(augmented_boxes)
-        all_scores = torch.cat(all_scores)
-        sorted_scores = torch.sort(all_scores, descending=True)
+        if len(augmented_boxes) != 0:
+                    
+        
+            augmented_boxes = torch.cat(augmented_boxes)
+            all_scores = torch.cat(all_scores)
+            sorted_scores = torch.sort(all_scores, descending=True)
+            augmented_boxes = augmented_boxes[sorted_scores.indices]
+            iou_trh = 0.5
+            iou_matrix = IoU(augmented_boxes, augmented_boxes)
+            
+            
 
-        augmented_boxes = augmented_boxes[sorted_scores.indices]
-        iou_trh = 0.5
-        iou_matrix = IoU(augmented_boxes, augmented_boxes)
-        # filtrar minimo de n/2 1's por linha quando tiver n caixas
-
-        iou_matrix = iou_matrix.triu(diagonal=1)
-        iou_matrix[iou_matrix>=iou_trh] = 1.0
-        iou_matrix[iou_matrix<iou_trh] = 0.0
-        
-        solo_ind = iou_matrix.sum(dim=0)==0
-        
-        iou_matrix.fill_diagonal_(1.0)
-        
-        iou_matrix = iou_matrix[solo_ind]
-        
-        valid_ind = iou_matrix.sum(dim=1)>=ceil(len(angles)/2)
-        
-        iou_matrix = iou_matrix[valid_ind]
+            iou_matrix = iou_matrix.triu(diagonal=1)
+            iou_matrix[iou_matrix>=iou_trh] = 1.0
+            iou_matrix[iou_matrix<iou_trh] = 0.0
+            
+            solo_ind = iou_matrix.sum(dim=0)==0
+            
+            iou_matrix.fill_diagonal_(1.0)
+            
+            iou_matrix = iou_matrix[solo_ind]
+            
+            valid_ind = iou_matrix.sum(dim=1)>=ceil(len(angles)/2)
+            
+            iou_matrix = iou_matrix[valid_ind]
        
 
-        if iou_matrix.size()[0] == 0 :
-            continue
+            if iou_matrix.size()[0] != 0 :
+                
+            
+                final_boxes, final_scores= merge_gaussian_boxes(augmented_boxes,iou_matrix,sorted_scores)
+                
+                
+                
+                new_instances = InstanceData()
+                new_instances.bboxes = final_boxes  # Agora com tamanho 10
+                new_instances.scores = final_scores # Agora com tamanho 10
+                new_instances.labels = torch.zeros(len(final_boxes), dtype=torch.long, device=final_boxes.device)
+                
 
-        final_boxes, final_scores= merge_gaussian_boxes(augmented_boxes,iou_matrix,sorted_scores)
+                pred_sample.pred_instances = new_instances
         
         
         
-        new_instances = InstanceData()
-        new_instances.bboxes = final_boxes  # Agora com tamanho 10
-        new_instances.scores = final_scores # Agora com tamanho 10
-        new_instances.labels = torch.zeros(len(final_boxes), dtype=torch.long, device=final_boxes.device)
-        
-        # Se você tiver labels, lembre-se que eles também precisam ter tamanho 10
-        # new_instances.labels = final_labels 
-
-        # Substitui as instâncias antigas pelas novas no pred_sample
-        pred_sample.pred_instances = new_instances
-        
-      
         evaluator.process(
         data_samples=[pred_sample],
         data_batch=data_batch
@@ -240,7 +242,7 @@ def main():
     runner.model.eval()
 
         
-    angles_for_aug= [0,45]
+    angles_for_aug= [0,45,90,135]
 
     run_tta(cfg, runner, angles_for_aug)
     
