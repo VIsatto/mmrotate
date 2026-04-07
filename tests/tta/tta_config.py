@@ -6,33 +6,30 @@ from mmengine.config import Config
 from mmengine.runner import Runner
 from mmengine.dataset import Compose
 
-from typing import Dict
-from mmengine.logging import HistoryBuffer
 import torch
 import numpy as np
 import gaussian_conv as gc
 
 from math import sqrt, ceil, floor
 
+import pickle
+from pathlib import Path
 import cv2
 
-from copy import deepcopy
 
 from mmdet.utils import register_all_modules as register_all_modules_mmdet
 
-from typing import List, Optional, Tuple, Union, no_type_check
 
 from mmengine.structures import InstanceData
 from mmengine.runner import load_checkpoint
-from mmdet.structures import DetDataSample
 
 from mmrotate.utils import register_all_modules
 
-import torch.nn.functional as F
 
 
 
-def run_tta(cfg, runner, angles):
+
+def run_tta(cfg, runner, angles, model_name):
 
     cfg.test_dataloader.dataset.test_mode = False
 
@@ -55,10 +52,13 @@ def run_tta(cfg, runner, angles):
     runner.call_hook('before_test_epoch')
 
     
-    
+   
+   
    
 
     for i, data_batch in enumerate(dataloader):
+        # boxes_for_save = { a : [] for a in angles}
+
         augmented_boxes = []
         all_scores = []
         print(f'Batch: {i}')
@@ -66,14 +66,18 @@ def run_tta(cfg, runner, angles):
         for angle in angles:
             batch_copy = data_batch.copy()
             
-
+            # box_n_score = {'box':0, 'score':0}
             if(angle == 0):
                 outputs = runner.model.test_step(batch_copy)
                 pred_sample = outputs[0]
 
-                
                 augmented_boxes.append(pred_sample.pred_instances.bboxes)
                 all_scores.append(pred_sample.pred_instances.scores)
+                # box_n_score['box'] = pred_sample.pred_instances.bboxes
+                # box_n_score['score'] = pred_sample.pred_instances.scores
+                # boxes_for_save[angle].append(box_n_score)
+                
+               
                 
                 
 
@@ -92,33 +96,51 @@ def run_tta(cfg, runner, angles):
                     padding_ok = True
                     
                 r_image = mmcv.imrotate(img = padded_img, angle = angle)
-                new_img = r_image
+                
                 
                 r_image= img.new_tensor(r_image).permute(2,0,1)
-                
+                new_h, new_w = r_image.shape[1], r_image.shape[2]
+
+                batch_copy['data_samples'][0].set_metainfo({
+                    'img_shape': (new_h, new_w),
+                    'batch_input_shape': (new_h, new_w)
+                    
+                })
                 batch_copy['inputs'][0] = r_image
                 outputs = runner.model.test_step(batch_copy)
                 
                 pred_sample = outputs[0]
                 
-                ori_img = cv2.imread(metainfo['img_path'])
                 
                 if len(pred_sample.pred_instances.bboxes) == 0:
                     continue
+               
                 
-                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, shape, metainfo['scale_factor'] ,padding=(pad_left, pad_top))
-                # draw_rotated_boxes(ori_img, new_boxes, f'tests/tta/images/{angle}check.jpg')
+                new_boxes = invert_rotation(pred_sample.pred_instances.bboxes, angle, shape, metainfo['scale_factor'] ,padding=(pad_left, pad_top ))
+                
                 
                 augmented_boxes.append(new_boxes)
                 all_scores.append(pred_sample.pred_instances.scores)
-        
+
+                # box_n_score['box'] = new_boxes
+                # box_n_score['score'] = pred_sample.pred_instances.scores
+                # boxes_for_save[angle].append(box_n_score)
+
         if len(augmented_boxes) != 0:
                     
             augmented_boxes = torch.cat(augmented_boxes)
+            if augmented_boxes.numel() == 0:
+                evaluator.process(
+                data_samples=[],
+                data_batch=data_batch
+                )
+                continue
+            
             all_scores = torch.cat(all_scores)
             sorted_scores = torch.sort(all_scores, descending=True)
             augmented_boxes = augmented_boxes[sorted_scores.indices]
             iou_trh = 0.5
+            
             iou_matrix = IoU(augmented_boxes, augmented_boxes)
             
             
@@ -139,44 +161,59 @@ def run_tta(cfg, runner, angles):
             
             
             
+            
             iou_matrix = iou_matrix[valid_ind]
        
             iou_matrix *= sorted_scores.values
 
-            
+           
             
             if iou_matrix.size()[0] != 0 :
                 
-            
-                final_boxes, final_scores= merge_gaussian_boxes(augmented_boxes,iou_matrix,sorted_scores)
-                
-                new_instances = InstanceData()
-                new_instances.bboxes = final_boxes  
-                new_instances.scores = final_scores 
-                new_instances.labels = torch.zeros(len(final_boxes), dtype=torch.long, device=final_boxes.device)
-                
+                if len(angles) > 1:
+                    final_boxes, final_scores= merge_gaussian_boxes(augmented_boxes,iou_matrix,sorted_scores)
+                    
+                    new_instances = InstanceData()
+                    new_instances.bboxes = final_boxes  
+                    new_instances.scores = final_scores 
+                    new_instances.labels = torch.zeros(len(final_boxes), dtype=torch.long, device=final_boxes.device)
+                    
 
-                pred_sample.pred_instances = new_instances
-
+                    pred_sample.pred_instances = new_instances
+                else:
+                    if(angle != 0):
+                        new_instances = InstanceData() 
+                        new_instances.bboxes = new_boxes  
+                        new_instances.scores = pred_sample.pred_instances.scores
+                        new_instances.labels = torch.zeros(len(new_boxes), dtype=torch.long, device=new_boxes.device)
+                        pred_sample.pred_instances = new_instances
+                        
                 evaluator.process(
                 data_samples=[pred_sample],
                 data_batch=data_batch
                 )
 
-                # draw_rotated_boxes(ori_img, f'tests/tta/images/{i}_img_check.jpg', final_boxes)
+                
+
+               
             else:
                 evaluator.process(
                 data_samples=[],
                 data_batch=data_batch
                 )
         
-                # draw_rotated_boxes(ori_img, f'tests/tta/images/{i}_img_check.jpg')
         
+        # folder_path = Path(f'/workspaces/mmrotate/tests/tta/predictions/{model_name}/view_{i}')
+        # folder_path.mkdir(parents=True, exist_ok=True)
+
+        # for ang in angles:
+            
+        #     file_path = folder_path / f'{ang}.pkl'
+
+        #     with open(file_path, 'wb') as file:
+        #         pickle.dump(boxes_for_save[ang], file)      
        
         
-    
-
-
     metrics = evaluator.evaluate(len(dataloader.dataset))
     runner.call_hook('after_val_epoch', metrics=metrics)
     runner.call_hook('after_run')
@@ -238,22 +275,6 @@ def merge_gaussian_boxes(augmented_boxes, iou_matrix ,sorted_scores):
     
     aggregated_boxes = aggregated_boxes.sum(dim=1) / iou_matrix.sum(dim=1).unsqueeze(-1)
 
-   
-    # for i, list in enumerate(aggregated_boxes):
-    #     # num_boxes = mask[i].sum(dim=0)
-        
-    #     # if (num_boxes.item()>1):
-    #     #     ind = list.sum(dim=1) > 1
-    #     #     final_scores.append(sorted_scores.values[ind].max())
-    #     #     final_gaus.append(list.sum(dim=0))
-
-        
-    #     print(list)
-    #     exit()
-    #     # final_scores.append(sorted_scores.values[ind].max())
-    # final_gaus.append(list)   
-    
-    # for tensor in final_gaus:
     final_boxes = gc.gaussian_to_rbbox(aggregated_boxes, 1.0)
 
     
@@ -265,10 +286,22 @@ def main():
     register_all_modules_mmdet(init_default_scope=False)
     register_all_modules(init_default_scope=False)
 
-    config_path = 'configs/rotated_retinanet/rotated-retinanet-hbox-oc_r50_fpn_rr-6x_hrsc.py'
+    # config_path = 'configs/rotated_retinanet/rotated-retinanet-hbox-oc_r50_fpn_rr-6x_hrsc.py'
+    #config_path = 'configs/psc/rotated-retinanet-rbox-le90_r50_fpn_psc_rr-6x_hrsc.py'
+    config_path = 'configs/psc/rotated-fcos-hbox-le90_r50_fpn_psc_rr-6x_hrsc.py'
+
     cfg = Config.fromfile(config_path)
-    cfg.work_dir = 'work_dirs/tta_rotated_retinanet_test'
-    cfg.load_from = 'checkpoint/rretinanet/epoch_72.pth'
+
+    # cfg.work_dir = 'work_dirs/tta_rotated_retinanet_test'
+    # cfg.load_from = 'checkpoint/rretinanet/epoch_72.pth'
+
+    # cfg.work_dir = 'work_dirs/tta_rotated_retinanet_psc_test'
+    # cfg.load_from = 'checkpoint/psc_retinanet/epoch_72.pth'
+
+    cfg.work_dir = 'work_dirs/tta_fcos_psc_test'
+    cfg.load_from = 'checkpoint/psc_fcos/epoch_72.pth'
+
+    
 
     runner = Runner.from_cfg(cfg)
 
@@ -279,7 +312,7 @@ def main():
         
     angles_for_aug= [0,45,90]
 
-    run_tta(cfg, runner, angles_for_aug)
+    run_tta(cfg, runner, angles_for_aug,'psc_fcos')
     
     
         
